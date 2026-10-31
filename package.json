@@ -1,0 +1,8 @@
+{
+  "name": "docker-hub-worker-proxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,13 @@
+name = "docker-hub-worker-proxy"
+main = "src/index.js"
+compatibility_date = "2026-10-31"
+
+# Users attach their own Custom Domain in the Cloudflare Dashboard.
+# No personal domain, account ID, zone ID, or secret is required in this file.
+workers_dev = false
+
+# Alternatively, configure a Custom Domain here instead of managing it
+# in the Dashboard. Replace the placeholder with a hostname in your Zone.
+# [[routes]]
+# pattern = "YOUR_SUBDOMAIN.YOUR_DOMAIN"
+# custom_domain = true
