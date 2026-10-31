@@ -38,15 +38,50 @@ function stripHopByHopHeaders(headers) {
   }
 }
 
-function buildUpstreamUrl(pathname, search) {
-  if (pathname === "/token") {
+const ALLOWED_TOKEN_QUERY_PARAMS = new Set([
+  "service",
+  "scope",
+  "client_id",
+  "account",
+  // Accepted for Docker-client compatibility, but deliberately not forwarded.
+  "offline_token",
+]);
+
+// Docker repository path components: lowercase alphanumerics with the
+// separators permitted by Docker's repository-name convention.
+const REPOSITORY_COMPONENT = "[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*";
+const PULL_SCOPE_PATTERN = new RegExp(
+  `^repository:${REPOSITORY_COMPONENT}(?:/${REPOSITORY_COMPONENT})*:pull$`,
+);
+
+function buildUpstreamUrl(url, env = {}) {
+  if (url.pathname === "/token") {
+    // Never derive the upstream hostname or path from user input.
     const target = new URL(`https://${AUTH_HOST}/token`);
-    target.search = search;
+    target.searchParams.set("service", REGISTRY_SERVICE);
+
+    // Forward only validated, required token parameters.
+    for (const scope of url.searchParams.getAll("scope")) {
+      target.searchParams.append("scope", scope);
+    }
+
+    const clientId = url.searchParams.get("client_id");
+    if (clientId) target.searchParams.set("client_id", clientId);
+
+    // If operator credentials are configured, keep the account parameter
+    // consistent with the account whose PAT is used for the token exchange.
+    const configuredUsername = env.DOCKERHUB_USERNAME?.trim();
+    const account = configuredUsername || url.searchParams.get("account");
+    if (account) target.searchParams.set("account", account);
+
+    // Do not forward offline_token=true. The client gets a short-lived
+    // bearer token; future token requests are authenticated again by this
+    // Worker with its PAT. This avoids issuing a long-lived refresh token.
     return target;
   }
 
-  if (pathname === "/v2" || pathname.startsWith("/v2/")) {
-    return new URL(`${pathname}${search}`, `https://${REGISTRY_HOST}`);
+  if (url.pathname === "/v2" || url.pathname.startsWith("/v2/")) {
+    return new URL(`${url.pathname}${url.search}`, `https://${REGISTRY_HOST}`);
   }
 
   return null;
@@ -97,16 +132,55 @@ function buildBasicAuthorization(username, token) {
 }
 
 function validateTokenRequest(url) {
-  const services = url.searchParams.getAll("service");
-  if (services.some((service) => service !== REGISTRY_SERVICE)) {
-    return "Unsupported token service";
+  const params = url.searchParams;
+
+  if (url.search.length > 4096) {
+    return "Token query is too large";
   }
 
-  // This is a pull-only mirror. Never let a visitor use the configured
-  // upstream account to mint push/delete-capable registry tokens.
-  for (const scope of url.searchParams.getAll("scope")) {
-    const match = /^repository:([^:]+):pull$/.exec(scope);
-    if (!match) return "Only repository pull scopes are supported";
+  const services = params.getAll("service");
+  if (services.length !== 1 || services[0] !== REGISTRY_SERVICE) {
+    return "A single supported token service is required";
+  }
+
+  // Reject unknown parameters instead of forwarding arbitrary token-service
+  // options. offline_token is recognized for client compatibility but is
+  // stripped by buildUpstreamUrl so no long-lived refresh token is issued.
+  for (const key of params.keys()) {
+    if (!ALLOWED_TOKEN_QUERY_PARAMS.has(key)) {
+      return "Unsupported token parameter";
+    }
+  }
+
+  const scopes = params.getAll("scope");
+  if (scopes.length > 8) {
+    return "Too many token scopes";
+  }
+
+  // Docker's /v2/ ping may request a service token without a repository scope.
+  // If scopes are present, every one must be a single-repository pull scope.
+  for (const scope of scopes) {
+    if (scope.length > 512 || !PULL_SCOPE_PATTERN.test(scope)) {
+      return "Only repository pull scopes are supported";
+    }
+  }
+
+  for (const name of ["client_id", "account", "offline_token"]) {
+    if (params.getAll(name).length > 1) {
+      return `Duplicate ${name} parameter`;
+    }
+  }
+
+  for (const name of ["client_id", "account"]) {
+    const value = params.get(name);
+    if (value && (value.length > 128 || /[\u0000-\u001F\u007F]/.test(value))) {
+      return `Invalid ${name} parameter`;
+    }
+  }
+
+  const offlineToken = params.get("offline_token");
+  if (offlineToken !== null && offlineToken !== "true" && offlineToken !== "false") {
+    return "Invalid offline_token parameter";
   }
 
   return null;
@@ -135,7 +209,7 @@ export default {
       }
     }
 
-    const upstreamUrl = buildUpstreamUrl(url.pathname, url.search);
+    const upstreamUrl = buildUpstreamUrl(url, env);
     if (!upstreamUrl) {
       return textResponse("Not Found\n", 404);
     }
@@ -157,6 +231,16 @@ export default {
     // Store both values as Cloudflare Worker Secrets, never in wrangler.toml.
     const username = env.DOCKERHUB_USERNAME?.trim();
     const token = env.DOCKERHUB_TOKEN?.trim();
+
+    if (isTokenRequest) {
+      console.log("[Docker Hub Auth]", {
+        usernameConfigured: Boolean(username),
+        tokenConfigured: Boolean(token),
+        authenticationEnabled: Boolean(username && token),
+        mode: username && token ? "authenticated" : "anonymous",
+      });
+    }
+
     if (isTokenRequest && username && token) {
       requestHeaders.set(
         "authorization",

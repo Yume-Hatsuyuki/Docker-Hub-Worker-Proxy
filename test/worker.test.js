@@ -261,5 +261,76 @@ test("token endpoint rejects non-Docker-Hub token services", async () => {
   );
 
   assert.equal(response.status, 400);
-  assert.match(await response.text(), /Unsupported token service/);
+  assert.match(await response.text(), /supported token service/);
+});
+
+test("token requests require exactly one Docker Hub service", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("fetch should not be called");
+  };
+
+  const missingService = await worker.fetch(
+    new Request("https://mirror.example.test/token?scope=repository%3Alibrary%2Falpine%3Apull"),
+  );
+  assert.equal(missingService.status, 400);
+
+  const duplicateService = await worker.fetch(
+    new Request("https://mirror.example.test/token?service=registry.docker.io&service=registry.docker.io"),
+  );
+  assert.equal(duplicateService.status, 400);
+});
+
+test("token requests reject unknown query parameters instead of forwarding them", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("fetch should not be called");
+  };
+
+  const response = await worker.fetch(
+    new Request("https://mirror.example.test/token?service=registry.docker.io&url=https%3A%2F%2Fevil.example"),
+  );
+
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Unsupported token parameter/);
+});
+
+test("offline_token is accepted for client compatibility but never forwarded upstream", async () => {
+  let capturedUrl;
+
+  globalThis.fetch = async (input) => {
+    capturedUrl = new URL(input.url);
+    return Response.json({ token: "short-lived-token" });
+  };
+
+  const response = await worker.fetch(
+    new Request(
+      "https://mirror.example.test/token?service=registry.docker.io&scope=repository%3Alibrary%2Falpine%3Apull&offline_token=true&client_id=docker",
+    ),
+    {
+      DOCKERHUB_USERNAME: "operator-user",
+      DOCKERHUB_TOKEN: "operator-pat",
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(capturedUrl.hostname, "auth.docker.io");
+  assert.equal(capturedUrl.searchParams.has("offline_token"), false);
+  assert.equal(capturedUrl.searchParams.get("client_id"), "docker");
+  assert.equal(capturedUrl.searchParams.get("account"), "operator-user");
+});
+
+test("service-only token requests are allowed for Registry V2 ping", async () => {
+  let capturedUrl;
+
+  globalThis.fetch = async (input) => {
+    capturedUrl = new URL(input.url);
+    return Response.json({ token: "service-token" });
+  };
+
+  const response = await worker.fetch(
+    new Request("https://mirror.example.test/token?service=registry.docker.io"),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(capturedUrl.searchParams.get("service"), "registry.docker.io");
+  assert.equal(capturedUrl.searchParams.has("scope"), false);
 });

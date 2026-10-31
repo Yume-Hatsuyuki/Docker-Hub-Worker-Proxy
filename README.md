@@ -14,6 +14,7 @@ docker pull hello-world
 - 将 Bearer Token 请求转发至 Docker Hub 官方 Token 服务。
 - 可选使用部署者自己的 Docker Hub 用户名和 Personal Access Token（PAT）获取已认证的 Bearer Token；不配置时保持匿名模式。
 - Token scope 限制为 Docker Hub 仓库的 `pull`，拒绝通过代理申请 `push` 等写权限。
+- Token 服务只接受固定的 `registry.docker.io`、有限数量的仓库 scope 和白名单参数；`offline_token` 不会转发，避免向访客签发长期 refresh token。
 - 重写 `WWW-Authenticate` 中的 Token Realm，使 Docker 客户端通过自己的 Worker 域名获取 Token。
 - 保留 Docker Hub 返回的外部 Blob/CDN 重定向，让客户端直接下载大型镜像层。
 - 支持 `GET` 和 `HEAD`，覆盖普通镜像拉取流程。
@@ -79,17 +80,19 @@ Cloudflare 不同界面版本的按钮文字可能略有差异；目标是先创
 
 官方说明：[Docker Hub Access Token permissions](https://docs.docker.com/security/access-tokens/reference/)。
 
-#### 4.2 在 Cloudflare 添加两个 Secret
+#### 4.2 在 Cloudflare 添加两个运行时 Secret
 
 1. 回到 Cloudflare Dashboard → **Workers & Pages**。
 2. 选择 `docker-hub-worker-proxy`。
 3. 打开 **Settings**。
-4. 找到 **Variables and Secrets**，点击 **Add**。
+4. 找到 **Runtime variables and secrets** 区域，点击 **Add**（部分界面可能显示 **Add variable**）。
 5. 类型选择 **Secret**，变量名称填写 `DOCKERHUB_USERNAME`，值填写 Docker Hub 用户名。
 6. 点击 **Add variable**，再添加第二个 Secret：
    - 名称：`DOCKERHUB_TOKEN`
    - 值：刚才创建的 PAT
-7. 点击 **Deploy**，使新 Secret 生效。
+7. 确认两个条目都出现在 **Runtime variables and secrets** 区域，然后点击 **Deploy**，使新 Secret 随 Worker 新版本生效。
+
+**不要把这两个值添加到 Build configuration → Build variables。** Build variables 仅供构建过程使用，不会自动注入 Worker 请求处理函数的运行时 `env` 对象；本项目的 `env.DOCKERHUB_USERNAME` 和 `env.DOCKERHUB_TOKEN` 只会读取 Worker 的运行时绑定。
 
 务必选择 **Secret**，不要选择普通 Text/Variable。Secret 值保存后不会再以明文显示。
 
@@ -223,6 +226,8 @@ Buildx 可能使用独立的 BuildKit daemon 配置。如果 `docker buildx buil
 - 仅转发 `GET` / `HEAD`，并且只接受 `/v2`、`/v2/…` 和 `/token` 路径。
 - 移除逐跳请求头、Cookie 及常见访客 IP 转发头；保留 Docker 协议所需的 `Authorization`、`Accept`、`Range` 和条件请求头。
 - 项目没有内置客户端访问认证。任何能够访问该域名的人都可以使用代理。配置上游账号后，这些访客会共享部署者的 Docker Hub 配额；公开使用前，建议配置 Cloudflare WAF / IP 访问规则及 Rate Limiting 并监控流量。
+- Token 请求只允许 `repository:<name>:pull` scope；`push`、`delete` 等写权限会被拒绝。Token 服务的上游主机和路径固定，用户不能通过查询参数指定其他目标。
+- `offline_token` 参数会被识别但不会转发。Worker 使用部署者 PAT 重新换取短期 Bearer Token，不需要向客户端发放长期 refresh token。
 - PAT 必须选择 `Repo Public Read-only`。不要将可读取私有仓库的 PAT 用于公开代理。
 - 不要向仓库提交私有凭据、账户标识、API Token 或个人域名。
 - 本项目不规避 Docker Hub 的服务条款、身份验证要求或 Fair Use Policy。
