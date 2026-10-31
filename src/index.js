@@ -1,5 +1,6 @@
 const REGISTRY_HOST = "registry-1.docker.io";
 const AUTH_HOST = "auth.docker.io";
+const REGISTRY_SERVICE = "registry.docker.io";
 const ALLOWED_METHODS = new Set(["GET", "HEAD"]);
 
 const HOP_BY_HOP_HEADERS = [
@@ -87,8 +88,32 @@ function textResponse(body, status, extraHeaders = {}) {
   });
 }
 
+function buildBasicAuthorization(username, token) {
+  // TextEncoder keeps this safe for UTF-8 input instead of assuming ASCII.
+  const bytes = new TextEncoder().encode(`${username}:${token}`);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `Basic ${btoa(binary)}`;
+}
+
+function validateTokenRequest(url) {
+  const services = url.searchParams.getAll("service");
+  if (services.some((service) => service !== REGISTRY_SERVICE)) {
+    return "Unsupported token service";
+  }
+
+  // This is a pull-only mirror. Never let a visitor use the configured
+  // upstream account to mint push/delete-capable registry tokens.
+  for (const scope of url.searchParams.getAll("scope")) {
+    const match = /^repository:([^:]+):pull$/.exec(scope);
+    if (!match) return "Only repository pull scopes are supported";
+  }
+
+  return null;
+}
+
 export default {
-  async fetch(request) {
+  async fetch(request, env = {}) {
     const url = new URL(request.url);
 
     // A small root health response is useful when setting up the hostname.
@@ -100,6 +125,14 @@ export default {
       return textResponse("Method Not Allowed\n", 405, {
         allow: "GET, HEAD",
       });
+    }
+
+    const isTokenRequest = url.pathname === "/token";
+    if (isTokenRequest) {
+      const validationError = validateTokenRequest(url);
+      if (validationError) {
+        return textResponse(`${validationError}\n`, 400);
+      }
     }
 
     const upstreamUrl = buildUpstreamUrl(url.pathname, url.search);
@@ -116,6 +149,19 @@ export default {
     // Do not forward visitor IP or browser cookie headers to Docker Hub.
     for (const name of PRIVATE_FORWARDING_HEADERS) {
       requestHeaders.delete(name);
+    }
+
+    // Optional operator-provided credentials are used only for the token
+    // exchange. They override client-supplied auth so every anonymous client
+    // can use the operator's authenticated Docker Hub pull allowance.
+    // Store both values as Cloudflare Worker Secrets, never in wrangler.toml.
+    const username = env.DOCKERHUB_USERNAME?.trim();
+    const token = env.DOCKERHUB_TOKEN?.trim();
+    if (isTokenRequest && username && token) {
+      requestHeaders.set(
+        "authorization",
+        buildBasicAuthorization(username, token),
+      );
     }
 
     try {

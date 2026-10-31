@@ -58,6 +58,7 @@ test("token requests are sent only to auth.docker.io and preserve query and auth
       "https://mirror.example.test/token?service=registry.docker.io&scope=repository%3Alibrary%2Falpine%3Apull",
       { headers: { authorization: "Basic dGVzdDp0ZXN0" } },
     ),
+    {},
   );
 
   assert.equal(response.status, 200);
@@ -160,4 +161,105 @@ test("hop-by-hop and visitor-identifying request headers are stripped", async ()
   assert.equal(capturedHeaders.has("cf-connecting-ip"), false);
   assert.equal(capturedHeaders.has("cookie"), false);
   assert.equal(capturedHeaders.get("authorization"), "Bearer preserve-me");
+});
+
+
+test("configured Docker Hub credentials are injected only into token requests", async () => {
+  let capturedUrl;
+  let capturedHeaders;
+
+  globalThis.fetch = async (input) => {
+    capturedUrl = new URL(input.url);
+    capturedHeaders = new Headers(input.headers);
+    return Response.json({ token: "upstream-token" });
+  };
+
+  await worker.fetch(
+    new Request(
+      "https://mirror.example.test/token?service=registry.docker.io&scope=repository%3Alibrary%2Falpine%3Apull",
+      { headers: { authorization: "Basic client-supplied" } },
+    ),
+    {
+      DOCKERHUB_USERNAME: "operator-user",
+      DOCKERHUB_TOKEN: "operator-pat",
+    },
+  );
+
+  assert.equal(capturedUrl.hostname, "auth.docker.io");
+  assert.equal(
+    capturedHeaders.get("authorization"),
+    `Basic ${btoa("operator-user:operator-pat")}`,
+  );
+});
+
+test("configured Docker Hub credentials are never sent to Registry requests", async () => {
+  let capturedUrl;
+  let capturedHeaders;
+
+  globalThis.fetch = async (input) => {
+    capturedUrl = new URL(input.url);
+    capturedHeaders = new Headers(input.headers);
+    return new Response("{}", { status: 200 });
+  };
+
+  await worker.fetch(
+    new Request("https://mirror.example.test/v2/library/alpine/manifests/latest"),
+    {
+      DOCKERHUB_USERNAME: "operator-user",
+      DOCKERHUB_TOKEN: "operator-pat",
+    },
+  );
+
+  assert.equal(capturedUrl.hostname, "registry-1.docker.io");
+  assert.equal(capturedHeaders.has("authorization"), false);
+});
+
+test("partial upstream credential configuration does not inject Basic auth", async () => {
+  let capturedHeaders;
+
+  globalThis.fetch = async (input) => {
+    capturedHeaders = new Headers(input.headers);
+    return Response.json({ token: "anonymous-token" });
+  };
+
+  await worker.fetch(
+    new Request(
+      "https://mirror.example.test/token?service=registry.docker.io&scope=repository%3Alibrary%2Falpine%3Apull",
+    ),
+    { DOCKERHUB_USERNAME: "operator-user" },
+  );
+
+  assert.equal(capturedHeaders.has("authorization"), false);
+});
+
+test("token endpoint rejects non-pull scopes", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("fetch should not be called");
+  };
+
+  const response = await worker.fetch(
+    new Request(
+      "https://mirror.example.test/token?service=registry.docker.io&scope=repository%3Alibrary%2Falpine%3Apull%2Cpush",
+    ),
+    {
+      DOCKERHUB_USERNAME: "operator-user",
+      DOCKERHUB_TOKEN: "operator-pat",
+    },
+  );
+
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Only repository pull scopes/);
+});
+
+test("token endpoint rejects non-Docker-Hub token services", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("fetch should not be called");
+  };
+
+  const response = await worker.fetch(
+    new Request("https://mirror.example.test/token?service=other.example"),
+  );
+
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /Unsupported token service/);
 });
